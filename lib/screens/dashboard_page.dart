@@ -21,24 +21,17 @@ class DashboardPage extends StatefulWidget {
 class _DashboardPageState extends State<DashboardPage> {
   Timer? _autoRefreshTimer;
 
-  /// Устройства, о которых знает сервер; до первых данных —
-  /// знакомые контроллеры со статусом «ожидание».
+  /// Все устройства комплекса (3 × BM + 6 × Dixell).
+  /// Статус берём из живых данных MQTT; пока данных нет — «ожидание».
   List<DeviceModel> get _devices {
     final known = MqttService.instance.deviceStatuses;
-    if (known.isNotEmpty) {
-      return [
-        for (final entry in known.entries)
-          DeviceModel(
-            deviceId: entry.key,
-            name: deviceDisplayName(entry.key),
-            status: entry.value,
-          ),
-      ];
-    }
     return [
-      const DeviceModel(deviceId: 'BM01', name: 'Камера газации №1'),
-      const DeviceModel(deviceId: 'BM02', name: 'Камера газации №2'),
-      const DeviceModel(deviceId: 'BM03', name: 'Камера газации №3'),
+      for (final id in kAllDeviceIds)
+        DeviceModel(
+          deviceId: id,
+          name: deviceDisplayName(id),
+          status: known[id] ?? DeviceStatus.waiting,
+        ),
     ];
   }
 

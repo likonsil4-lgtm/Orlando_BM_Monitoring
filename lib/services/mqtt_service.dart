@@ -6,6 +6,7 @@ import 'package:mqtt_client/mqtt_client.dart';
 import 'package:mqtt_client/mqtt_server_client.dart';
 
 import '../models/device_model.dart';
+import '../models/dixell_model.dart';
 import 'notification_service.dart';
 
 /// Один сырый пакет, полученный от ESP32.
@@ -66,7 +67,7 @@ class MqttService extends ChangeNotifier {
   void startWatchdog() {
     _watchdogTimer ??= Timer.periodic(
       const Duration(seconds: 10),
-      (_) => _checkDeviceTimeouts(),
+          (_) => _checkDeviceTimeouts(),
     );
   }
 
@@ -96,6 +97,8 @@ class MqttService extends ChangeNotifier {
 
   static const String _rawTopic = 'bm/+/raw';
   static const String _statusTopic = 'bm/+/status';
+  static const String _dixellStateTopic = 'dixell/+/state';
+  static const String _dixellStatusTopic = 'dixell/+/status';
 
   MqttServerClient? _client;
 
@@ -110,6 +113,9 @@ class MqttService extends ChangeNotifier {
 
   /// Сырые пакеты, сгруппированные по устройствам.
   final Map<String, List<RawPacket>> _packetsByDevice = {};
+
+  /// Последние состояния контроллеров Dixell по устройствам.
+  final Map<String, DixellState> _dixellStates = {};
 
   /// Статусы устройств по статус-топикам.
   final Map<String, DeviceStatus> _deviceStatuses = {};
@@ -127,6 +133,9 @@ class MqttService extends ChangeNotifier {
 
   Map<String, DeviceStatus> get deviceStatuses =>
       Map.unmodifiable(_deviceStatuses);
+
+  Map<String, DixellState> get dixellStates =>
+      Map.unmodifiable(_dixellStates);
 
   List<String> get deviceIds => _packetsByDevice.keys.toList();
 
@@ -247,9 +256,21 @@ class MqttService extends ChangeNotifier {
 
     client
       ..subscribe(_rawTopic, MqttQos.atLeastOnce)
-      ..subscribe(_statusTopic, MqttQos.atLeastOnce);
+      ..subscribe(_statusTopic, MqttQos.atLeastOnce)
+      ..subscribe(_dixellStateTopic, MqttQos.atLeastOnce)
+      ..subscribe(_dixellStatusTopic, MqttQos.atLeastOnce);
 
     client.updates!.listen(_onMessage);
+  }
+
+  /// Публикация JSON в топик (используется для команд управления
+  /// контроллерами Dixell; в приложении вызывается только для admin).
+  void publishJson(String topic, Map<String, dynamic> json) {
+    final client = _client;
+    if (client == null || !_connected) return;
+    final builder = MqttClientPayloadBuilder();
+    builder.addString(jsonEncode(json));
+    client.publishMessage(topic, MqttQos.atLeastOnce, builder.payload!);
   }
 
   void _onMessage(List<MqttReceivedMessage<MqttMessage>> events) {
@@ -264,7 +285,11 @@ class MqttService extends ChangeNotifier {
         final decoded = jsonDecode(payload);
         if (decoded is! Map<String, dynamic>) continue;
 
-        if (topic.endsWith('/raw') && decoded['type'] == 'raw') {
+        if (topic.startsWith('dixell/') &&
+            topic.endsWith('/state') &&
+            decoded['type'] == 'dixell') {
+          _handleDixellState(DixellState.fromJson(decoded));
+        } else if (topic.endsWith('/raw') && decoded['type'] == 'raw') {
           _handleRawPacket(RawPacket.fromEsp32Json(decoded));
         } else if (topic.endsWith('/status')) {
           _handleStatusMessage(decoded);
@@ -276,22 +301,32 @@ class MqttService extends ChangeNotifier {
   }
 
   void _handleRawPacket(RawPacket packet) {
-    _packetsByDevice.putIfAbsent(packet.deviceId, () => []).add(packet);
-    _lastSeenAt[packet.deviceId] = DateTime.now();
+    // Идентификатор приводим к верхнему регистру: ESP32 публикует
+    // «bm01», а приложение везде оперирует «BM01».
+    final deviceId = packet.deviceId.toUpperCase();
+    _packetsByDevice.putIfAbsent(deviceId, () => []).add(packet);
+    _lastSeenAt[deviceId] = DateTime.now();
 
-    final list = _packetsByDevice[packet.deviceId]!;
+    final list = _packetsByDevice[deviceId]!;
     if (list.length > 200) {
-      _packetsByDevice[packet.deviceId] =
-          list.sublist(list.length - 200);
+      _packetsByDevice[deviceId] = list.sublist(list.length - 200);
     }
 
     // Пакет пришёл — устройство явно в сети.
-    _updateDeviceStatus(packet.deviceId, true);
+    _updateDeviceStatus(deviceId, true);
+    notifyListeners();
+  }
+
+  void _handleDixellState(DixellState state) {
+    final deviceId = state.deviceId.toUpperCase();
+    _dixellStates[deviceId] = state;
+    _lastSeenAt[deviceId] = DateTime.now();
+    _updateDeviceStatus(deviceId, true);
     notifyListeners();
   }
 
   void _handleStatusMessage(Map<String, dynamic> json) {
-    final deviceId = (json['device'] ?? '').toString();
+    final deviceId = (json['device'] ?? '').toString().toUpperCase();
     if (deviceId.isEmpty) return;
     final online = json['online'] == true;
     if (online) _lastSeenAt[deviceId] = DateTime.now();
@@ -301,7 +336,7 @@ class MqttService extends ChangeNotifier {
 
   void _updateDeviceStatus(String deviceId, bool online) {
     final newStatus =
-        online ? DeviceStatus.online : DeviceStatus.offline;
+    online ? DeviceStatus.online : DeviceStatus.offline;
     final old = _deviceStatuses[deviceId];
 
     if (old == newStatus) return;

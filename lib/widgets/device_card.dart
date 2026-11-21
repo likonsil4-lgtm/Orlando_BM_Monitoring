@@ -3,6 +3,9 @@ import 'package:material_ui/material_ui.dart';
 import '../core/constants.dart';
 import '../models/device_model.dart';
 import '../screens/device_details_page.dart';
+import '../screens/dixell_details_page.dart';
+import '../models/dixell_model.dart';
+import '../services/mqtt_service.dart';
 
 class DeviceCard extends StatelessWidget {
   final DeviceModel device;
@@ -12,16 +15,26 @@ class DeviceCard extends StatelessWidget {
     required this.device,
   });
 
+  /// Текущая температура для Dixell-камер (если данные уже приходили).
+  String? get _temperatureText {
+    if (deviceKindOf(device.deviceId) != DeviceKind.dixell) return null;
+    final state = MqttService.instance.dixellStates[device.deviceId];
+    final t1 = state?.t1;
+    if (t1 == null) return null;
+    return '${DixellState.formatTenths(t1)} °C';
+  }
+
   @override
   Widget build(BuildContext context) {
     return InkWell(
       borderRadius: BorderRadius.circular(16),
       onTap: () {
+        final page = deviceKindOf(device.deviceId) == DeviceKind.dixell
+            ? DixellDetailsPage(device: device)
+            : DeviceDetailsPage(device: device);
         Navigator.push(
           context,
-          MaterialPageRoute(
-            builder: (_) => DeviceDetailsPage(device: device),
-          ),
+          MaterialPageRoute(builder: (_) => page),
         );
       },
       child: Container(
@@ -84,6 +97,22 @@ class DeviceCard extends StatelessWidget {
                           fontSize: 11,
                         ),
                       ),
+                      if (_temperatureText != null) ...[
+                        const SizedBox(width: 10),
+                        Icon(
+                          Icons.thermostat,
+                          color: Colors.orangeAccent,
+                          size: 12,
+                        ),
+                        const SizedBox(width: 3),
+                        Text(
+                          _temperatureText!,
+                          style: const TextStyle(
+                            color: secondaryText,
+                            fontSize: 11,
+                          ),
+                        ),
+                      ],
                     ],
                   ),
                 ],
