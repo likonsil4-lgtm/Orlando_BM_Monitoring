@@ -9,6 +9,7 @@ Future<void> main() async {
 
   // Уведомления и подключение к серверу — сразу при запуске.
   await NotificationService.instance.init();
+  MqttService.instance.startWatchdog();
   MqttService.instance.connect();
 
   runApp(const BMMonitorApp());

@@ -66,8 +66,8 @@ class MqttService extends ChangeNotifier {
   /// Запуск сторожа таймаута устройств.
   void startWatchdog() {
     _watchdogTimer ??= Timer.periodic(
-      const Duration(seconds: 10),
-          (_) => _checkDeviceTimeouts(),
+      const Duration(seconds: 2),
+      (_) => _checkDeviceTimeouts(),
     );
   }
 
@@ -85,6 +85,18 @@ class MqttService extends ChangeNotifier {
       changed = true;
     });
 
+    // After a fresh broker connection, devices with no live packets also
+    // leave the waiting state when the initial observation window expires.
+    final connectedAt = lastConnectedAt;
+    if (_connected && connectedAt != null &&
+        now.difference(connectedAt) > deviceTimeout) {
+      for (final id in kAllDeviceIds) {
+        if (_lastSeenAt.containsKey(id) ||
+            _deviceStatuses[id] == DeviceStatus.offline) continue;
+        _deviceStatuses[id] = DeviceStatus.offline;
+        changed = true;
+      }
+    }
     if (changed) notifyListeners();
   }
 
@@ -120,13 +132,58 @@ class MqttService extends ChangeNotifier {
   /// Статусы устройств по статус-топикам.
   final Map<String, DeviceStatus> _deviceStatuses = {};
 
-  /// Время последнего признака жизни устройства (пакет или статус).
+  /// Время последнего живого пакета raw/state.
   final Map<String, DateTime> _lastSeenAt = {};
 
   /// Если от устройства нет данных дольше этого — считаем офлайн.
   static const Duration deviceTimeout = Duration(seconds: 40);
 
   Timer? _watchdogTimer;
+  Timer? _reconnectTimer;
+  StreamSubscription<List<MqttReceivedMessage<MqttMessage>>>? _updates;
+
+  // DX03 bench only. Require fresh state and capability from the bridge.
+  final Map<int, Completer<Map<String, dynamic>>> _setpointAcks = {};
+  final Set<int> _usedTokens = {};
+  bool canControlDixell(String id) {
+    id = id.toUpperCase();
+    final state = _dixellStates[id];
+    final seen = _lastSeenAt[id];
+    return id == 'DX03' && _connected &&
+        _deviceStatuses[id] == DeviceStatus.online && seen != null &&
+        DateTime.now().difference(seen) <= const Duration(seconds: 20) &&
+        state != null && state.benchMode && state.setpointControl &&
+        state.commandToken != 0 && !_usedTokens.contains(state.commandToken);
+  }
+
+  Future<Map<String, dynamic>> setDixellSetpoint(String id, double value) async {
+    id = id.toUpperCase();
+    if (!value.isFinite || value < -20 || value > 10 ||
+        !canControlDixell(id)) return {'ok': false, 'reason': 'unavailable'};
+    final raw = (value * 10).round();
+    if ((value * 10 - raw).abs() > 0.00001) {
+      return {'ok': false, 'reason': 'precision'};
+    }
+    final token = _dixellStates[id]!.commandToken;
+    final completer = Completer<Map<String, dynamic>>();
+    _setpointAcks[token] = completer;
+    final builder = MqttClientPayloadBuilder();
+    builder.addString(jsonEncode({'action': 'setpoint', 'raw': raw, 'token': token}));
+    _usedTokens.add(token);
+    if (_usedTokens.length > 128) _usedTokens.remove(_usedTokens.first);
+    try {
+      _client!.publishMessage('dixell/$id/cmd', MqttQos.atLeastOnce,
+          builder.payload!, retain: false);
+      notifyListeners();
+      return await completer.future.timeout(const Duration(seconds: 30),
+          onTimeout: () => {'ok': false, 'reason': 'timeout'});
+    } catch (_) {
+      return {'ok': false, 'reason': 'send_failed'};
+    } finally {
+      _setpointAcks.remove(token);
+      notifyListeners();
+    }
+  }
 
   Map<String, List<RawPacket>> get packetsByDevice =>
       Map.unmodifiable(_packetsByDevice);
@@ -142,104 +199,101 @@ class MqttService extends ChangeNotifier {
   // ================= ПОДКЛЮЧЕНИЕ =================
 
   Future<void> connect() async {
+    startWatchdog();
     if (_connected || _connecting) return;
+    _reconnectTimer?.cancel();
     _connecting = true;
     _manualDisconnect = false;
-    notifyListeners();
-
-    final clientId =
-        'BM_Monitor_${DateTime.now().millisecondsSinceEpoch}';
-
+    final clientId = 'BM_Monitor_${DateTime.now().microsecondsSinceEpoch}';
     final client = MqttServerClient.withPort(host, clientId, port);
+    _client = client;
     client.secure = true;
-    client.keepAlivePeriod = 30;
-    client.autoReconnect = true;
-    client.resubscribeOnAutoReconnect = true;
-    client.onConnected = _onConnected;
-    client.onDisconnected = _onDisconnected;
-    client.onAutoReconnect = _onAutoReconnect;
+    client.keepAlivePeriod = 15;
+    // Единственный механизм переподключения — наш таймер.
+    client.autoReconnect = false;
+    client.onDisconnected = () => _onDisconnected(client);
     client.connectionMessage = MqttConnectMessage()
         .withClientIdentifier(clientId)
         .authenticateAs(username, password)
         .startClean();
-
+    notifyListeners();
     try {
       await client.connect();
-    } catch (_) {
-      _connecting = false;
-      _client = null;
-      _setConnected(false);
-      _scheduleReconnect();
-      return;
-    }
-
-    _connecting = false;
-
-    if (client.connectionStatus!.state ==
-        MqttConnectionState.connected) {
-      _client = client;
+      if (!identical(_client, client)) {
+        client.disconnect();
+        return;
+      }
+      if (client.connectionStatus?.state != MqttConnectionState.connected) {
+        throw StateError('MQTT not connected');
+      }
       _subscribe();
-      _onConnected();
-    } else {
+      _connecting = false;
+      lastConnectedAt = DateTime.now();
+      _setConnected(true);
+      NotificationService.instance.serverStatus(connected: true);
+    } catch (e) {
+      debugPrint('MQTT connect: $e');
+      _onDisconnected(client);
       client.disconnect();
-      _client = null;
-      _setConnected(false);
-      _scheduleReconnect();
     }
   }
 
   Future<void> disconnect() async {
     _manualDisconnect = true;
-    _client?.disconnect();
-    _client = null;
-    _setConnected(false);
-  }
-
-  /// Проверка соединения: при обрыве — переподключение.
-  Future<void> checkConnection() async {
+    _reconnectTimer?.cancel();
     final client = _client;
-    if (_connected &&
-        client != null &&
-        client.connectionStatus!.state ==
-            MqttConnectionState.connected) {
-      return;
+    if (client != null) {
+      _onDisconnected(client);
+      client.disconnect();
     }
-    await connect();
   }
 
-  /// Обновление данных по запросу (pull-to-refresh):
-  /// проверяет соединение и оповещает слушателей.
+  Future<void> checkConnection() async {
+    _checkDeviceTimeouts();
+    final client = _client;
+    if (_connected && client != null &&
+        client.connectionStatus?.state == MqttConnectionState.connected) return;
+    if (_connecting) return;
+    if (client != null) {
+      _onDisconnected(client);
+      client.disconnect();
+    }
+    if (!_manualDisconnect) await connect();
+  }
+
   Future<void> refresh() async {
     await checkConnection();
     notifyListeners();
   }
 
   void _scheduleReconnect() {
-    if (_manualDisconnect) return;
-    Future.delayed(const Duration(seconds: 5), () {
-      if (!_connected && !_connecting && !_manualDisconnect) {
-        connect();
-      }
+    if (_manualDisconnect || (_reconnectTimer?.isActive ?? false)) return;
+    _reconnectTimer = Timer(const Duration(seconds: 5), () {
+      if (!_connected && !_connecting && !_manualDisconnect) connect();
     });
   }
 
-  void _onConnected() {
-    lastConnectedAt = DateTime.now();
-    _setConnected(true);
-    NotificationService.instance.serverStatus(connected: true);
-  }
-
-  void _onDisconnected() {
+  void _onDisconnected(MqttServerClient client) {
+    if (!identical(_client, client)) return;
+    _client = null;
+    _connecting = false;
+    _updates?.cancel();
+    _updates = null;
     final wasConnected = _connected;
+    _lastSeenAt.clear();
+    for (final pending in _setpointAcks.values) {
+      if (!pending.isCompleted) pending.complete({'ok': false, 'reason': 'disconnected'});
+    }
+    // Нет связи с брокером — доступность устройств не подтверждена.
+    for (final id in _deviceStatuses.keys.toList()) {
+      _deviceStatuses[id] = DeviceStatus.waiting;
+    }
     _setConnected(false);
+    if (!wasConnected) notifyListeners();
     if (wasConnected) {
       NotificationService.instance.serverStatus(connected: false);
     }
     _scheduleReconnect();
-  }
-
-  void _onAutoReconnect() {
-    debugPrint('MQTT: автоматическое переподключение...');
   }
 
   void _setConnected(bool value) {
@@ -254,29 +308,24 @@ class MqttService extends ChangeNotifier {
     final client = _client;
     if (client == null) return;
 
+    _updates = client.updates!.listen((events) {
+      if (identical(_client, client)) _onMessage(events);
+    });
     client
       ..subscribe(_rawTopic, MqttQos.atLeastOnce)
       ..subscribe(_statusTopic, MqttQos.atLeastOnce)
       ..subscribe(_dixellStateTopic, MqttQos.atLeastOnce)
-      ..subscribe(_dixellStatusTopic, MqttQos.atLeastOnce);
+      ..subscribe(_dixellStatusTopic, MqttQos.atLeastOnce)
+      ..subscribe('dixell/+/ack', MqttQos.atLeastOnce);
 
-    client.updates!.listen(_onMessage);
-  }
-
-  /// Публикация JSON в топик (используется для команд управления
-  /// контроллерами Dixell; в приложении вызывается только для admin).
-  void publishJson(String topic, Map<String, dynamic> json) {
-    final client = _client;
-    if (client == null || !_connected) return;
-    final builder = MqttClientPayloadBuilder();
-    builder.addString(jsonEncode(json));
-    client.publishMessage(topic, MqttQos.atLeastOnce, builder.payload!);
   }
 
   void _onMessage(List<MqttReceivedMessage<MqttMessage>> events) {
     for (final event in events) {
       final topic = event.topic;
       final message = event.payload as MqttPublishMessage;
+      // Retained — снимок из прошлого, не доказательство текущей связи.
+      if (message.header?.retain == true) continue;
       final payload = MqttPublishPayload.bytesToStringAsString(
         message.payload.message,
       );
@@ -285,7 +334,28 @@ class MqttService extends ChangeNotifier {
         final decoded = jsonDecode(payload);
         if (decoded is! Map<String, dynamic>) continue;
 
-        if (topic.startsWith('dixell/') &&
+        final parts = topic.split('/');
+        if (parts.length != 3) continue;
+        if (topic == 'dixell/bridge/status') {
+          if (decoded['online'] == false) {
+            for (final id in kAllDeviceIds.where((id) => id.startsWith('DX'))) {
+              _lastSeenAt.remove(id);
+              _updateDeviceStatus(id, false);
+            }
+            notifyListeners();
+          }
+          continue;
+        }
+        final id = (decoded['device'] ?? '').toString().toUpperCase();
+        if (!kAllDeviceIds.contains(id) || parts[1].toUpperCase() != id ||
+            (parts[0] == 'dixell' ? !id.startsWith('DX') :
+                parts[0] != 'bm' || !id.startsWith('BM'))) continue;
+
+        if (topic == 'dixell/DX03/ack' && decoded['action'] == 'setpoint') {
+          final token = decoded['token'];
+          final pending = token is int ? _setpointAcks[token] : null;
+          if (pending != null && !pending.isCompleted) pending.complete(decoded);
+        } else if (topic.startsWith('dixell/') &&
             topic.endsWith('/state') &&
             decoded['type'] == 'dixell') {
           _handleDixellState(DixellState.fromJson(decoded));
@@ -328,9 +398,11 @@ class MqttService extends ChangeNotifier {
   void _handleStatusMessage(Map<String, dynamic> json) {
     final deviceId = (json['device'] ?? '').toString().toUpperCase();
     if (deviceId.isEmpty) return;
-    final online = json['online'] == true;
-    if (online) _lastSeenAt[deviceId] = DateTime.now();
-    _updateDeviceStatus(deviceId, online);
+    // Статус true (в том числе старых BM-мостов) не продлевает жизнь.
+    // Только реальный raw/state подтверждает связь. Явный false — сразу offline.
+    if (json['online'] != false) return;
+    _lastSeenAt.remove(deviceId);
+    _updateDeviceStatus(deviceId, false);
     notifyListeners();
   }
 
@@ -343,7 +415,7 @@ class MqttService extends ChangeNotifier {
 
     // Уведомляем об отключении известного устройства
     // или о новом подключении.
-    if (old != null || online) {
+    if ((old == DeviceStatus.online && !online) || online) {
       NotificationService.instance
           .deviceStatus(deviceId, online: online);
     }

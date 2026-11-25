@@ -69,6 +69,9 @@ class _DeviceDetailsPageState extends State<DeviceDetailsPage> {
               const SizedBox(height: 16),
               if (frame == null) ...[
                 const _Placeholder(),
+              ] else if (!_isOnline) ...[
+                const Text('Свежих данных нет. Последние показания скрыты.',
+                    style: TextStyle(color: Colors.orangeAccent)),
               ] else ...[
                 _DisplayCard(
                   title: 'Режим работы',

@@ -50,19 +50,7 @@ class _DixellDetailsPageState extends State<DixellDetailsPage> {
 
   bool get _isAdmin => AuthService.instance.isAdmin;
 
-  void _sendCommand(Map<String, dynamic> cmd) {
-    MqttService.instance.publishJson(
-      'dixell/${widget.device.deviceId}/cmd',
-      cmd,
-    );
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text('Команда отправлена: ${cmd['action']}'),
-        backgroundColor: cardColor,
-        duration: const Duration(seconds: 2),
-      ),
-    );
-  }
+  bool _savingSetpoint = false;
 
   Future<void> _editSetpoint(DixellState state) async {
     final controller = TextEditingController(
@@ -80,7 +68,7 @@ class _DixellDetailsPageState extends State<DixellDetailsPage> {
                 const TextInputType.numberWithOptions(decimal: true, signed: true),
             autofocus: true,
             decoration: const InputDecoration(
-              hintText: 'например, 2.5',
+              hintText: 'от -20.0 до 10.0 (стенд)',
               suffixText: '°C',
             ),
           ),
@@ -102,42 +90,20 @@ class _DixellDetailsPageState extends State<DixellDetailsPage> {
         );
       },
     );
-    if (result == null) return;
-    _sendCommand({'action': 'setpoint', 'value': result});
-  }
-
-  Future<void> _confirmPower(bool turnOn) async {
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (dialogContext) {
-        return AlertDialog(
-          backgroundColor: cardColor,
-          title: Text(turnOn ? 'Включить контроллер?' : 'Выключить контроллер?'),
-          content: Text(
-            turnOn
-                ? 'Контроллер ${widget.device.name} будет включён.'
-                : 'Контроллер ${widget.device.name} будет остановлен.',
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(dialogContext).pop(false),
-              child: const Text('Отмена'),
-            ),
-            ElevatedButton(
-              style: ElevatedButton.styleFrom(
-                backgroundColor:
-                    turnOn ? accentColor : Colors.redAccent,
-                foregroundColor: Colors.white,
-              ),
-              onPressed: () => Navigator.of(dialogContext).pop(true),
-              child: Text(turnOn ? 'Включить' : 'Выключить'),
-            ),
-          ],
-        );
-      },
-    );
-    if (confirmed != true) return;
-    _sendCommand({'action': turnOn ? 'on' : 'off'});
+    if (result == null || !mounted || !_isAdmin || _savingSetpoint) return;
+    setState(() => _savingSetpoint = true);
+    final ack = await MqttService.instance.setDixellSetpoint(widget.device.deviceId, result);
+    if (!mounted) return;
+    setState(() => _savingSetpoint = false);
+    final ok = ack['ok'] == true;
+    final actual = ack['raw'];
+    final reason = ack['reason'];
+    final message = ok && actual is int
+        ? 'Уставка подтверждена: ${DixellState.formatTenths(actual)} °C'
+        : reason == 'unavailable' || reason == 'precision' || reason == 'out_of_bench_range'
+            ? 'Недоступно или значение вне -20…10 °C (шаг 0.1).'
+            : 'Запись не подтверждена. Проверьте уставку на Dixell.';
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
   }
 
   @override
@@ -160,7 +126,19 @@ class _DixellDetailsPageState extends State<DixellDetailsPage> {
               const SizedBox(height: 16),
               if (state == null)
                 const _Placeholder()
+              else if (!online)
+                const Text('Свежих данных нет. Последние показания скрыты.',
+                    style: TextStyle(color: secondaryText))
               else ...[
+                if (state.benchMode) ...[
+                  const Text('Стенд: датчики и нагрузка не подключены.',
+                      style: TextStyle(color: secondaryText)),
+                  const SizedBox(height: 12),
+                ] else if (!state.mapVerified) ...[
+                  const Text('Показания датчиков требуют сверки с дисплеем.',
+                      style: TextStyle(color: Colors.orangeAccent)),
+                  const SizedBox(height: 12),
+                ],
                 _buildTemperatureCard(state),
                 const SizedBox(height: 12),
                 Row(
@@ -192,7 +170,11 @@ class _DixellDetailsPageState extends State<DixellDetailsPage> {
                 _buildAlarmCard(state),
                 if (_isAdmin) ...[
                   const SizedBox(height: 12),
-                  _buildControlCard(state),
+                  if (state.benchMode)
+                    _buildControlCard(state)
+                  else
+                    const Text('Управление доступно только после индивидуальной проверки.',
+                        style: TextStyle(color: secondaryText)),
                 ],
                 const SizedBox(height: 12),
                 _buildTechCard(state),
@@ -266,9 +248,9 @@ class _DixellDetailsPageState extends State<DixellDetailsPage> {
   }
 
   Widget _buildTemperatureCard(DixellState state) {
-    final t1 = state.t1;
+    final t1 = state.benchMode ? null : state.t1;
     final alarmColor =
-        state.hasAlarm ? Colors.redAccent : accentColor;
+        state.mapVerified && state.hasAlarm ? Colors.redAccent : accentColor;
     return Container(
       padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
@@ -343,7 +325,7 @@ class _DixellDetailsPageState extends State<DixellDetailsPage> {
                 ),
                 const SizedBox(height: 2),
                 Text(
-                  on == null ? 'Неизвестно' : (on ? 'Работает' : 'Остановлен'),
+                  on == null || !state.mapVerified ? 'Не подтверждено' : (on ? 'Работает' : 'Остановлен'),
                   style: TextStyle(
                     fontSize: 16,
                     fontWeight: FontWeight.bold,
@@ -353,7 +335,7 @@ class _DixellDetailsPageState extends State<DixellDetailsPage> {
               ],
             ),
           ),
-          if ((state.t3 ?? state.t4) != null)
+          if (!state.benchMode && (state.t3 ?? state.t4) != null)
             Text(
               'P3: ${state.probe3Text}  P4: ${state.probe4Text}',
               style: const TextStyle(color: secondaryText, fontSize: 11),
@@ -364,6 +346,10 @@ class _DixellDetailsPageState extends State<DixellDetailsPage> {
   }
 
   Widget _buildAlarmCard(DixellState state) {
+    if (state.alm == null || !state.mapVerified) {
+      return const Text('Состояние аварий не подтверждено',
+          style: TextStyle(color: Colors.orangeAccent));
+    }
     final alarms = state.alarms;
     return Container(
       padding: const EdgeInsets.all(16),
@@ -416,7 +402,6 @@ class _DixellDetailsPageState extends State<DixellDetailsPage> {
   }
 
   Widget _buildControlCard(DixellState state) {
-    final on = state.on == true;
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
@@ -444,10 +429,11 @@ class _DixellDetailsPageState extends State<DixellDetailsPage> {
           ),
           const SizedBox(height: 14),
           OutlinedButton.icon(
-            onPressed: () => _editSetpoint(state),
+            onPressed: _savingSetpoint || !MqttService.instance.canControlDixell(widget.device.deviceId)
+                ? null : () => _editSetpoint(state),
             icon: const Icon(Icons.tune, size: 18),
             label: Text(
-              state.sp == null
+              _savingSetpoint ? 'Ожидаем подтверждение…' : state.sp == null
                   ? 'Задать уставку'
                   : 'Изменить уставку (${state.setpointText} °C)',
             ),
@@ -457,37 +443,8 @@ class _DixellDetailsPageState extends State<DixellDetailsPage> {
             ),
           ),
           const SizedBox(height: 10),
-          Row(
-            children: [
-              Expanded(
-                child: ElevatedButton.icon(
-                  onPressed: on ? null : () => _confirmPower(true),
-                  icon: const Icon(Icons.power_settings_new, size: 18),
-                  label: const Text('Вкл'),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: accentColor,
-                    foregroundColor: Colors.white,
-                    disabledBackgroundColor:
-                        accentColor.withValues(alpha: 0.2),
-                  ),
-                ),
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: ElevatedButton.icon(
-                  onPressed: on ? () => _confirmPower(false) : null,
-                  icon: const Icon(Icons.power_settings_new, size: 18),
-                  label: const Text('Выкл'),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.redAccent,
-                    foregroundColor: Colors.white,
-                    disabledBackgroundColor:
-                        Colors.redAccent.withValues(alpha: 0.2),
-                  ),
-                ),
-              ),
-            ],
-          ),
+          const Text('Стендовый диапазон: -20…10 °C. Вкл/выкл — после сверки катушки 513.',
+              style: TextStyle(color: secondaryText, fontSize: 12)),
         ],
       ),
     );
@@ -512,10 +469,13 @@ class _DixellDetailsPageState extends State<DixellDetailsPage> {
             ),
           ),
           const SizedBox(height: 12),
+          _techRow('P1 / P2 raw', '${state.t1 ?? "—"} / ${state.t2 ?? "—"}'),
+          _techRow('P3 / P4 raw', '${state.t3 ?? "—"} / ${state.t4 ?? "—"}'),
+          _techRow('SP raw (0x035F)', '${state.sp ?? "—"}'),
           _techRow('Uptime', '${state.uptimeMs ~/ 1000} с'),
           _techRow('Wi-Fi RSSI', '${state.rssi} dBm'),
           _techRow('Катушки 512..543',
-              '0x${state.coils.toRadixString(16).toUpperCase()}'),
+              state.coils == null ? '—' : '0x${state.coils!.toRadixString(16).toUpperCase()}'),
           _techRow(
             'Обновлено',
             '${state.receivedAt.hour.toString().padLeft(2, '0')}:'

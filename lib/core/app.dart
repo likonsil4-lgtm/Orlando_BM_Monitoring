@@ -6,6 +6,7 @@ import '../screens/settings_page.dart';
 import '../screens/users_page.dart';
 import '../services/activity_service.dart';
 import '../services/auth_service.dart';
+import '../services/mqtt_service.dart';
 import '../widgets/double_back_exit.dart';
 import 'constants.dart';
 
@@ -70,6 +71,9 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      MqttService.instance.checkConnection();
+    }
     final username = AuthService.instance.currentUser?.username;
     if (username == null) return;
 

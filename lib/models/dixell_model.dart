@@ -33,10 +33,16 @@ class DixellState {
 
   /// Маска аварий: бит 0 — высокая t°, 1 — низкая t°, 2 — ошибка датчика,
   /// 3 — внешний вход, 4 — EEPROM, 15 — любая авария.
-  final int alm;
+  final int? alm;
 
   /// Сырые катушки 512..543 (бит 0 = катушка 512).
-  final int coils;
+  final int? coils;
+
+  /// Карта регистров подтверждена на оборудовании.
+  final bool mapVerified;
+  final bool benchMode;
+  final bool setpointControl;
+  final int commandToken;
 
   final int uptimeMs;
   final int rssi;
@@ -51,8 +57,12 @@ class DixellState {
     this.t4,
     this.sp,
     this.on,
-    this.alm = 0,
-    this.coils = 0,
+    this.alm,
+    this.coils,
+    this.mapVerified = false,
+    this.benchMode = false,
+    this.setpointControl = false,
+    this.commandToken = 0,
     this.uptimeMs = 0,
     this.rssi = 0,
     required this.receivedAt,
@@ -74,8 +84,12 @@ class DixellState {
       t4: tenths('t4'),
       sp: tenths('sp'),
       on: json['on'] is bool ? json['on'] as bool : null,
-      alm: (json['alm'] as num?)?.toInt() ?? 0,
-      coils: (json['coils'] as num?)?.toInt() ?? 0,
+      alm: tenths('alm'),
+      coils: tenths('coils'),
+      mapVerified: json['map_verified'] == true,
+      benchMode: json['bench_mode'] == true,
+      setpointControl: json['setpoint_control'] == true,
+      commandToken: tenths('command_token') ?? 0,
       uptimeMs: (json['uptime_ms'] as num?)?.toInt() ?? 0,
       rssi: (json['rssi'] as num?)?.toInt() ?? 0,
       receivedAt: DateTime.now(),
@@ -90,10 +104,10 @@ class DixellState {
     return '$sign${abs ~/ 10}.${abs % 10}';
   }
 
-  String get probe1Text => formatTenths(t1);
-  String get probe2Text => formatTenths(t2);
-  String get probe3Text => formatTenths(t3);
-  String get probe4Text => formatTenths(t4);
+  String get probe1Text => formatTenths(benchMode ? null : t1);
+  String get probe2Text => formatTenths(benchMode ? null : t2);
+  String get probe3Text => formatTenths(benchMode ? null : t3);
+  String get probe4Text => formatTenths(benchMode ? null : t4);
   String get setpointText => formatTenths(sp);
 
   /// Список активных аварий (человекочитаемые названия).
@@ -106,11 +120,13 @@ class DixellState {
       4: 'Сбой EEPROM',
       15: 'Авария',
     };
+    final mask = alm;
+    if (mask == null) return [];
     return [
       for (final entry in names.entries)
-        if ((alm >> entry.key) & 1 == 1) entry.value,
+        if ((mask >> entry.key) & 1 == 1) entry.value,
     ];
   }
 
-  bool get hasAlarm => alm != 0;
+  bool get hasAlarm => alm != null && alm != 0;
 }

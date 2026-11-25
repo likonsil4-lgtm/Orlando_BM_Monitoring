@@ -17,10 +17,11 @@ class DeviceCard extends StatelessWidget {
 
   /// Текущая температура для Dixell-камер (если данные уже приходили).
   String? get _temperatureText {
-    if (deviceKindOf(device.deviceId) != DeviceKind.dixell) return null;
+    if (device.status != DeviceStatus.online ||
+        deviceKindOf(device.deviceId) != DeviceKind.dixell) return null;
     final state = MqttService.instance.dixellStates[device.deviceId];
     final t1 = state?.t1;
-    if (t1 == null) return null;
+    if (t1 == null || state?.mapVerified != true) return null;
     return '${DixellState.formatTenths(t1)} °C';
   }
 
