@@ -31,7 +31,7 @@ class _DeviceDetailsPageState extends State<DeviceDetailsPage> {
   }
 
   RawPacket? get _lastPacket {
-    final packets = MqttService.instance.packetsByDevice[widget.device.deviceId];
+    final packets = MqttService.instance.bmFramesByDevice[widget.device.deviceId.toUpperCase()];
     if (packets == null || packets.isEmpty) return null;
     return packets.last;
   }
@@ -98,7 +98,7 @@ class _DeviceDetailsPageState extends State<DeviceDetailsPage> {
                         title: 'День программы',
                         text: frame.currentDay != null
                             ? '${frame.currentDay} из ${frame.totalDays}'
-                            : '${frame.totalDays}',
+                            : '—',
                         unit: '',
                         icon: Icons.calendar_today_outlined,
                         iconColor: const Color(0xFF39D5A0),
@@ -122,7 +122,7 @@ class _DeviceDetailsPageState extends State<DeviceDetailsPage> {
                 ),
                 const SizedBox(height: 12),
                 _LedLineCard(
-                  title: 'Дни программы (линейка)',
+                  title: 'Дней в программе: ${frame.totalDays}',
                   leds: frame.dayLeds,
                   blinkMask: frame.blinkDays,
                 ),

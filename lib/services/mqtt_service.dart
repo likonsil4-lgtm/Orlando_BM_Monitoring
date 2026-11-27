@@ -8,6 +8,7 @@ import 'package:mqtt_client/mqtt_server_client.dart';
 import '../models/device_model.dart';
 import '../models/dixell_model.dart';
 import 'notification_service.dart';
+import 'bm_frame_assembler.dart';
 
 /// Один сырый пакет, полученный от ESP32.
 class RawPacket {
@@ -79,6 +80,7 @@ class MqttService extends ChangeNotifier {
       if (now.difference(lastSeen) <= deviceTimeout) return;
       if (_deviceStatuses[deviceId] == DeviceStatus.offline) return;
 
+      _bmAssemblers.remove(deviceId);
       _deviceStatuses[deviceId] = DeviceStatus.offline;
       NotificationService.instance
           .deviceStatus(deviceId, online: false);
@@ -125,6 +127,14 @@ class MqttService extends ChangeNotifier {
 
   /// Сырые пакеты, сгруппированные по устройствам.
   final Map<String, List<RawPacket>> _packetsByDevice = {};
+
+  // Сырые MQTT-фрагменты остаются в диагностике; экран BM получает
+  // только целые кадры с проверенной контрольной суммой.
+  final Map<String, BmFrameAssembler> _bmAssemblers = {};
+  final Map<String, List<RawPacket>> _bmFramesByDevice = {};
+
+  Map<String, List<RawPacket>> get bmFramesByDevice =>
+      Map.unmodifiable(_bmFramesByDevice);
 
   /// Последние состояния контроллеров Dixell по устройствам.
   final Map<String, DixellState> _dixellStates = {};
@@ -281,6 +291,7 @@ class MqttService extends ChangeNotifier {
     _updates = null;
     final wasConnected = _connected;
     _lastSeenAt.clear();
+    _bmAssemblers.clear();
     for (final pending in _setpointAcks.values) {
       if (!pending.isCompleted) pending.complete({'ok': false, 'reason': 'disconnected'});
     }
@@ -371,19 +382,39 @@ class MqttService extends ChangeNotifier {
   }
 
   void _handleRawPacket(RawPacket packet) {
-    // Идентификатор приводим к верхнему регистру: ESP32 публикует
-    // «bm01», а приложение везде оперирует «BM01».
     final deviceId = packet.deviceId.toUpperCase();
-    _packetsByDevice.putIfAbsent(deviceId, () => []).add(packet);
-    _lastSeenAt[deviceId] = DateTime.now();
+    if (!deviceId.startsWith('BM')) return;
 
-    final list = _packetsByDevice[deviceId]!;
-    if (list.length > 200) {
-      _packetsByDevice[deviceId] = list.sublist(list.length - 200);
+    final raw = _packetsByDevice.putIfAbsent(deviceId, () => []);
+    raw.add(packet);
+    if (raw.length > 200) raw.removeRange(0, raw.length - 200);
+
+    final assembler = _bmAssemblers.putIfAbsent(
+        deviceId, () => BmFrameAssembler());
+    final completed = assembler.addChunk(
+      hex: packet.hex,
+      length: packet.length,
+      sequence: packet.sequence,
+      uptimeMs: packet.uptimeMs,
+    );
+
+    if (completed.isNotEmpty) {
+      final frames = _bmFramesByDevice.putIfAbsent(deviceId, () => []);
+      for (final hex in completed) {
+        frames.add(RawPacket(
+          deviceId: deviceId,
+          sequence: packet.sequence,
+          uptimeMs: packet.uptimeMs,
+          length: 21,
+          hex: hex,
+          receivedAt: packet.receivedAt,
+        ));
+      }
+      if (frames.length > 200) frames.removeRange(0, frames.length - 200);
+      _lastSeenAt[deviceId] = DateTime.now();
+      _updateDeviceStatus(deviceId, true);
     }
-
-    // Пакет пришёл — устройство явно в сети.
-    _updateDeviceStatus(deviceId, true);
+    // Неполный пакет не затирает последнее достоверное показание.
     notifyListeners();
   }
 
@@ -402,6 +433,7 @@ class MqttService extends ChangeNotifier {
     // Только реальный raw/state подтверждает связь. Явный false — сразу offline.
     if (json['online'] != false) return;
     _lastSeenAt.remove(deviceId);
+    _bmAssemblers.remove(deviceId);
     _updateDeviceStatus(deviceId, false);
     notifyListeners();
   }
@@ -424,6 +456,8 @@ class MqttService extends ChangeNotifier {
 
   void clearHistory() {
     _packetsByDevice.clear();
+    _bmFramesByDevice.clear();
+    _bmAssemblers.clear();
     notifyListeners();
   }
 }

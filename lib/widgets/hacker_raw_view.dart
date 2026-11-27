@@ -65,8 +65,10 @@ class _HackerRawViewState extends State<HackerRawView> {
   void _onData() => _rebuild();
 
   void _rebuild() {
-    final packets =
-        MqttService.instance.packetsByDevice[widget.deviceId] ?? [];
+    final mqtt = MqttService.instance;
+    final source = widget.decodedMode
+        ? mqtt.bmFramesByDevice : mqtt.packetsByDevice;
+    final packets = source[widget.deviceId.toUpperCase()] ?? [];
     final take = packets.length > _maxLines
         ? packets.sublist(packets.length - _maxLines)
         : packets;
@@ -207,11 +209,11 @@ class _HackerRawViewState extends State<HackerRawView> {
     final frame = BmDecoder.instance.decodeHex(line.hex);
     if (frame == null) return line.hex;
     final mode = (frame.modeLabel ?? frame.modeText).padLeft(6);
-    final clock = frame.clockText.padLeft(6);
+    final clock = (frame.clockText.isEmpty ? '—' : frame.clockText).padLeft(6);
     final temp = frame.temperatureText.padLeft(6);
     final day = frame.currentDay != null
         ? '${frame.currentDay}/${frame.totalDays}'
-        : '${frame.totalDays}';
+        : '—/${frame.totalDays}';
     final relaysOn = BmDecoder.instance
         .relays(frame.relaysByte)
         .where((r) => r.on)
