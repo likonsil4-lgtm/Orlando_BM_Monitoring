@@ -19,9 +19,9 @@ class DeviceCard extends StatelessWidget {
   String? get _temperatureText {
     if (device.status != DeviceStatus.online ||
         deviceKindOf(device.deviceId) != DeviceKind.dixell) return null;
-    final state = MqttService.instance.dixellStates[device.deviceId];
+    final state = MqttService.instance.dixellStates[device.deviceId.toUpperCase()];
     final t1 = state?.t1;
-    if (t1 == null || state?.mapVerified != true) return null;
+    if (t1 == null) return null;
     return '${DixellState.formatTenths(t1)} °C';
   }
 

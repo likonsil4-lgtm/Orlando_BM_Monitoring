@@ -42,7 +42,9 @@ class DixellState {
   final bool mapVerified;
   final bool benchMode;
   final bool setpointControl;
+  final bool hasControlMetadata;
   final int commandToken;
+  final String firmwareVersion;
 
   final int uptimeMs;
   final int rssi;
@@ -62,7 +64,9 @@ class DixellState {
     this.mapVerified = false,
     this.benchMode = false,
     this.setpointControl = false,
+    this.hasControlMetadata = false,
     this.commandToken = 0,
+    this.firmwareVersion = 'unknown',
     this.uptimeMs = 0,
     this.rssi = 0,
     required this.receivedAt,
@@ -89,7 +93,10 @@ class DixellState {
       mapVerified: json['map_verified'] == true,
       benchMode: json['bench_mode'] == true,
       setpointControl: json['setpoint_control'] == true,
+      hasControlMetadata: json.containsKey('setpoint_control') ||
+          json.containsKey('command_token') || json.containsKey('bench_mode'),
       commandToken: tenths('command_token') ?? 0,
+      firmwareVersion: (json['fw'] ?? 'unknown').toString(),
       uptimeMs: (json['uptime_ms'] as num?)?.toInt() ?? 0,
       rssi: (json['rssi'] as num?)?.toInt() ?? 0,
       receivedAt: DateTime.now(),
@@ -104,10 +111,10 @@ class DixellState {
     return '$sign${abs ~/ 10}.${abs % 10}';
   }
 
-  String get probe1Text => formatTenths(benchMode ? null : t1);
-  String get probe2Text => formatTenths(benchMode ? null : t2);
-  String get probe3Text => formatTenths(benchMode ? null : t3);
-  String get probe4Text => formatTenths(benchMode ? null : t4);
+  String get probe1Text => formatTenths(t1);
+  String get probe2Text => formatTenths(t2);
+  String get probe3Text => formatTenths(t3);
+  String get probe4Text => formatTenths(t4);
   String get setpointText => formatTenths(sp);
 
   /// Список активных аварий (человекочитаемые названия).

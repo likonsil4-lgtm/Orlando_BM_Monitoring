@@ -152,19 +152,36 @@ class MqttService extends ChangeNotifier {
   Timer? _reconnectTimer;
   StreamSubscription<List<MqttReceivedMessage<MqttMessage>>>? _updates;
 
-  // DX03 bench only. Require fresh state and capability from the bridge.
-  final Map<int, Completer<Map<String, dynamic>>> _setpointAcks = {};
-  final Set<int> _usedTokens = {};
-  bool canControlDixell(String id) {
+  // Require fresh state and write capability for the addressed Dixell.
+  final Map<String, Completer<Map<String, dynamic>>> _setpointAcks = {};
+  final Set<String> _usedTokens = {};
+  // Original firmware has no command token. Confirm by fresh register readback.
+  final Map<String, int> _legacyTargets = {};
+  final Map<String, Completer<Map<String, dynamic>>> _legacyWrites = {};
+
+  String? dixellControlBlockReason(String id) {
     id = id.toUpperCase();
     final state = _dixellStates[id];
     final seen = _lastSeenAt[id];
-    return id == 'DX03' && _connected &&
-        _deviceStatuses[id] == DeviceStatus.online && seen != null &&
-        DateTime.now().difference(seen) <= const Duration(seconds: 20) &&
-        state != null && state.benchMode && state.setpointControl &&
-        state.commandToken != 0 && !_usedTokens.contains(state.commandToken);
+    if (!RegExp(r'^DX0[1-6]$').hasMatch(id)) return 'Неизвестный адрес Dixell';
+    if (!_connected) return 'Нет подключения к MQTT';
+    if (_deviceStatuses[id] != DeviceStatus.online || seen == null ||
+        DateTime.now().difference(seen) > deviceTimeout) {
+      return 'Нет свежих данных от контроллера';
+    }
+    if (state == null || state.sp == null) return 'Уставка не прочитана';
+    if (state.hasControlMetadata) {
+      if (!state.setpointControl) return 'ESP32 не принимает команды для $id';
+      if (state.commandToken == 0) return 'Ожидаем свежую команду от ESP32';
+      if (_usedTokens.contains('$id:${state.commandToken}')) {
+        return 'Ожидаем обновление данных';
+      }
+    }
+    if (_legacyWrites.containsKey(id)) return 'Ожидаем подтверждение уставки';
+    return null;
   }
+
+  bool canControlDixell(String id) => dixellControlBlockReason(id) == null;
 
   Future<Map<String, dynamic>> setDixellSetpoint(String id, double value) async {
     id = id.toUpperCase();
@@ -174,12 +191,22 @@ class MqttService extends ChangeNotifier {
     if ((value * 10 - raw).abs() > 0.00001) {
       return {'ok': false, 'reason': 'precision'};
     }
-    final token = _dixellStates[id]!.commandToken;
+    // The transport token is internal, not a permission or calibration flag.
+    final state = _dixellStates[id]!;
+    if (!state.hasControlMetadata) {
+      return _setLegacyDixellSetpoint(id, raw);
+    }
+    final token = state.commandToken;
+    if (token == 0) return {'ok': false, 'reason': 'firmware_mismatch'};
+    final key = '$id:$token';
+    if (_setpointAcks.containsKey(key) || _usedTokens.contains(key)) {
+      return {'ok': false, 'reason': 'pending'};
+    }
     final completer = Completer<Map<String, dynamic>>();
-    _setpointAcks[token] = completer;
+    _setpointAcks[key] = completer;
     final builder = MqttClientPayloadBuilder();
     builder.addString(jsonEncode({'action': 'setpoint', 'raw': raw, 'token': token}));
-    _usedTokens.add(token);
+    _usedTokens.add(key);
     if (_usedTokens.length > 128) _usedTokens.remove(_usedTokens.first);
     try {
       _client!.publishMessage('dixell/$id/cmd', MqttQos.atLeastOnce,
@@ -190,7 +217,31 @@ class MqttService extends ChangeNotifier {
     } catch (_) {
       return {'ok': false, 'reason': 'send_failed'};
     } finally {
-      _setpointAcks.remove(token);
+      _setpointAcks.remove(key);
+      notifyListeners();
+    }
+  }
+
+  Future<Map<String, dynamic>> _setLegacyDixellSetpoint(String id, int raw) async {
+    if (_legacyWrites.containsKey(id)) return {'ok': false, 'reason': 'pending'};
+    if (_dixellStates[id]?.sp == raw) return {'ok': true, 'raw': raw};
+    final completer = Completer<Map<String, dynamic>>();
+    _legacyWrites[id] = completer;
+    _legacyTargets[id] = raw;
+    final builder = MqttClientPayloadBuilder();
+    builder.addString(jsonEncode({'action': 'setpoint', 'value': raw / 10}));
+    try {
+      // No retained command, no automatic retry and no token bypass.
+      _client!.publishMessage('dixell/$id/cmd', MqttQos.atMostOnce,
+          builder.payload!, retain: false);
+      notifyListeners();
+      return await completer.future.timeout(const Duration(seconds: 60),
+          onTimeout: () => {'ok': false, 'reason': 'timeout'});
+    } catch (_) {
+      return {'ok': false, 'reason': 'send_failed'};
+    } finally {
+      _legacyWrites.remove(id);
+      _legacyTargets.remove(id);
       notifyListeners();
     }
   }
@@ -295,6 +346,9 @@ class MqttService extends ChangeNotifier {
     for (final pending in _setpointAcks.values) {
       if (!pending.isCompleted) pending.complete({'ok': false, 'reason': 'disconnected'});
     }
+    for (final pending in _legacyWrites.values) {
+      if (!pending.isCompleted) pending.complete({'ok': false, 'reason': 'disconnected'});
+    }
     // Нет связи с брокером — доступность устройств не подтверждена.
     for (final id in _deviceStatuses.keys.toList()) {
       _deviceStatuses[id] = DeviceStatus.waiting;
@@ -362,9 +416,9 @@ class MqttService extends ChangeNotifier {
             (parts[0] == 'dixell' ? !id.startsWith('DX') :
                 parts[0] != 'bm' || !id.startsWith('BM'))) continue;
 
-        if (topic == 'dixell/DX03/ack' && decoded['action'] == 'setpoint') {
+        if (topic == 'dixell/$id/ack' && decoded['action'] == 'setpoint') {
           final token = decoded['token'];
-          final pending = token is int ? _setpointAcks[token] : null;
+          final pending = token is int ? _setpointAcks['$id:$token'] : null;
           if (pending != null && !pending.isCompleted) pending.complete(decoded);
         } else if (topic.startsWith('dixell/') &&
             topic.endsWith('/state') &&
@@ -421,6 +475,11 @@ class MqttService extends ChangeNotifier {
   void _handleDixellState(DixellState state) {
     final deviceId = state.deviceId.toUpperCase();
     _dixellStates[deviceId] = state;
+    final legacy = _legacyWrites[deviceId];
+    if (legacy != null && !legacy.isCompleted && !state.hasControlMetadata &&
+        state.sp != null && state.sp == _legacyTargets[deviceId]) {
+      legacy.complete({'ok': true, 'raw': state.sp});
+    }
     _lastSeenAt[deviceId] = DateTime.now();
     _updateDeviceStatus(deviceId, true);
     notifyListeners();

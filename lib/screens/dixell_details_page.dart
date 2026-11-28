@@ -37,7 +37,7 @@ class _DixellDetailsPageState extends State<DixellDetailsPage> {
   }
 
   DixellState? get _state =>
-      MqttService.instance.dixellStates[widget.device.deviceId];
+      MqttService.instance.dixellStates[widget.device.deviceId.toUpperCase()];
 
   bool get _isOnline {
     final statuses = MqttService.instance.deviceStatuses;
@@ -68,7 +68,7 @@ class _DixellDetailsPageState extends State<DixellDetailsPage> {
                 const TextInputType.numberWithOptions(decimal: true, signed: true),
             autofocus: true,
             decoration: const InputDecoration(
-              hintText: 'от -20.0 до 10.0 (стенд)',
+              hintText: 'от -20.0 до +10.0',
               suffixText: '°C',
             ),
           ),
@@ -91,6 +91,12 @@ class _DixellDetailsPageState extends State<DixellDetailsPage> {
       },
     );
     if (result == null || !mounted || !_isAdmin || _savingSetpoint) return;
+    if (!result.isFinite || result < -20 || result > 10 ||
+        (result * 10 - (result * 10).round()).abs() > 0.00001) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('Допустимо от -20 до +10 °C, шаг 0.1.')));
+      return;
+    }
     setState(() => _savingSetpoint = true);
     final ack = await MqttService.instance.setDixellSetpoint(widget.device.deviceId, result);
     if (!mounted) return;
@@ -100,7 +106,11 @@ class _DixellDetailsPageState extends State<DixellDetailsPage> {
     final reason = ack['reason'];
     final message = ok && actual is int
         ? 'Уставка подтверждена: ${DixellState.formatTenths(actual)} °C'
-        : reason == 'unavailable' || reason == 'precision' || reason == 'out_of_bench_range'
+        : reason == 'firmware_mismatch'
+            ? 'ESP32 не принимает запись для этого адреса.'
+            : reason == 'pending'
+                ? 'Ожидается обновление данных. Повторите через несколько секунд.'
+                : reason == 'unavailable' || reason == 'precision' || reason == 'out_of_range'
             ? 'Недоступно или значение вне -20…10 °C (шаг 0.1).'
             : 'Запись не подтверждена. Проверьте уставку на Dixell.';
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
@@ -123,6 +133,9 @@ class _DixellDetailsPageState extends State<DixellDetailsPage> {
             padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
             children: [
               _buildHeader(online),
+              const SizedBox(height: 4),
+              const Text('Flutter: DX-FLUTTER-ONLY-1',
+                  style: TextStyle(color: secondaryText, fontSize: 11)),
               const SizedBox(height: 16),
               if (state == null)
                 const _Placeholder()
@@ -130,15 +143,6 @@ class _DixellDetailsPageState extends State<DixellDetailsPage> {
                 const Text('Свежих данных нет. Последние показания скрыты.',
                     style: TextStyle(color: secondaryText))
               else ...[
-                if (state.benchMode) ...[
-                  const Text('Стенд: датчики и нагрузка не подключены.',
-                      style: TextStyle(color: secondaryText)),
-                  const SizedBox(height: 12),
-                ] else if (!state.mapVerified) ...[
-                  const Text('Показания датчиков требуют сверки с дисплеем.',
-                      style: TextStyle(color: Colors.orangeAccent)),
-                  const SizedBox(height: 12),
-                ],
                 _buildTemperatureCard(state),
                 const SizedBox(height: 12),
                 Row(
@@ -165,16 +169,18 @@ class _DixellDetailsPageState extends State<DixellDetailsPage> {
                   ],
                 ),
                 const SizedBox(height: 12),
-                _buildStatusCard(state),
-                const SizedBox(height: 12),
-                _buildAlarmCard(state),
+                if (state.mapVerified && state.on != null) ...[
+                  _buildStatusCard(state),
+                  const SizedBox(height: 12),
+                ],
+                if (state.mapVerified && state.alm != null)
+                  _buildAlarmCard(state),
                 if (_isAdmin) ...[
                   const SizedBox(height: 12),
-                  if (state.benchMode)
-                    _buildControlCard(state)
-                  else
-                    const Text('Управление доступно только после индивидуальной проверки.',
-                        style: TextStyle(color: secondaryText)),
+                  _buildControlCard(state),
+                ] else ...[
+                  const Text('Изменение уставки доступно только администратору.',
+                      style: TextStyle(color: secondaryText)),
                 ],
                 const SizedBox(height: 12),
                 _buildTechCard(state),
@@ -248,7 +254,7 @@ class _DixellDetailsPageState extends State<DixellDetailsPage> {
   }
 
   Widget _buildTemperatureCard(DixellState state) {
-    final t1 = state.benchMode ? null : state.t1;
+    final t1 = state.t1;
     final alarmColor =
         state.mapVerified && state.hasAlarm ? Colors.redAccent : accentColor;
     return Container(
@@ -335,7 +341,7 @@ class _DixellDetailsPageState extends State<DixellDetailsPage> {
               ],
             ),
           ),
-          if (!state.benchMode && (state.t3 ?? state.t4) != null)
+          if ((state.t3 ?? state.t4) != null)
             Text(
               'P3: ${state.probe3Text}  P4: ${state.probe4Text}',
               style: const TextStyle(color: secondaryText, fontSize: 11),
@@ -402,6 +408,7 @@ class _DixellDetailsPageState extends State<DixellDetailsPage> {
   }
 
   Widget _buildControlCard(DixellState state) {
+    final blocked = MqttService.instance.dixellControlBlockReason(widget.device.deviceId);
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
@@ -429,7 +436,7 @@ class _DixellDetailsPageState extends State<DixellDetailsPage> {
           ),
           const SizedBox(height: 14),
           OutlinedButton.icon(
-            onPressed: _savingSetpoint || !MqttService.instance.canControlDixell(widget.device.deviceId)
+            onPressed: _savingSetpoint || blocked != null
                 ? null : () => _editSetpoint(state),
             icon: const Icon(Icons.tune, size: 18),
             label: Text(
@@ -443,7 +450,9 @@ class _DixellDetailsPageState extends State<DixellDetailsPage> {
             ),
           ),
           const SizedBox(height: 10),
-          const Text('Стендовый диапазон: -20…10 °C. Вкл/выкл — после сверки катушки 513.',
+          if (blocked != null)
+            Text(blocked, style: const TextStyle(color: Colors.orangeAccent, fontSize: 12)),
+          const Text('Диапазон: -20…+10 °C.',
               style: TextStyle(color: secondaryText, fontSize: 12)),
         ],
       ),
@@ -469,6 +478,13 @@ class _DixellDetailsPageState extends State<DixellDetailsPage> {
             ),
           ),
           const SizedBox(height: 12),
+          _techRow('Версия приложения', 'DX-FLUTTER-ONLY-1'),
+          _techRow('Протокол команд', state.hasControlMetadata ? 'С токеном' : 'Исходный'),
+          _techRow('Запись ESP32', state.hasControlMetadata
+              ? (state.setpointControl ? 'Разрешена' : 'Запрещена') : 'Исходный протокол'),
+          _techRow('ESP32 FW', state.firmwareVersion),
+          if (!state.mapVerified)
+            _techRow('Аварии / режим', 'Нет подтверждённой карты'),
           _techRow('P1 / P2 raw', '${state.t1 ?? "—"} / ${state.t2 ?? "—"}'),
           _techRow('P3 / P4 raw', '${state.t3 ?? "—"} / ${state.t4 ?? "—"}'),
           _techRow('SP raw (0x035F)', '${state.sp ?? "—"}'),
